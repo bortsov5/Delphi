@@ -1,0 +1,585 @@
+unit uMSCryptoAPI;
+
+interface
+
+uses
+  uCryptoAPI, SysUtils, Windows, wcrypt2, Variants, Classes, Dialogs,
+  uSigningCertificates, uSigningCertificateInterfaces, eds_comLib_TLB, AvCryptMailCOMSystem_TLB,
+  MSXML2_TLB;
+
+type
+  TMSCryptoAPI = class(TCryptoAPI)
+  private
+    Doc: IXMLDOMDocument3;
+    function GetToken(aString, SepChar: string; TokenNum: Integer): string;
+    function NumToken(aString, SepChar: string): Integer;
+    function strV(s: string; finfT: string): string;
+    procedure AddTextNode(const ParentNodeXPath, ATextNode: WideString);
+    procedure AddSubNode(const ParentNodeXPath, ElementName: string);
+  public
+    procedure PrepareCertificates; override;
+    function NeedAuthorization: Boolean; override;
+    function ValidateLoginTopby(const ACertificateKey, ALogin, APassword: string;
+      var AMessage: string): Boolean;
+    function SignTopby(const ACertificateKey, ALogin, APassword: string;
+      const AContent: string; var ASign, AMessage: string): Boolean;
+    function SignXMLTopby(const ACertificateKey, ALogin, APassword: string;
+      const AContent: WideString; var ASign, AMessage: string): Boolean;
+    function ValidateLogin(const ACertificateKey, ALogin, APassword: string;
+      var AMessage: string): Boolean; override;
+    function Sign(const ACertificateKey, ALogin, APassword: string;
+      const AContent: string; var ASign, AMessage: string): Boolean; override;
+  end;
+
+implementation
+
+{ TMSCryptoAPI }
+
+function TMSCryptoAPI.GetToken(aString, SepChar: string; TokenNum: Integer): string;
+var
+  Token: string;
+  StrLen: Integer;
+  TNum: Integer;
+  TEnd: Integer;
+begin
+  StrLen := Length(aString);
+  TNum := 1;
+  TEnd := StrLen;
+  while ((TNum <= TokenNum) and (TEnd <> 0)) do
+  begin
+    TEnd := Pos(SepChar, aString);
+    if TEnd <> 0 then
+    begin
+      Token := Copy(aString, 1, TEnd - 1);
+      Delete(aString, 1, TEnd);
+      Inc(TNum);
+    end
+    else
+    begin
+      Token := aString;
+    end;
+  end;
+  if TNum >= TokenNum then
+  begin
+    Result := Token;
+  end
+  else
+  begin
+    Result := '';
+  end;
+end;
+
+function TMSCryptoAPI.NumToken(aString, SepChar: string): Integer;
+var
+  RChar: Char;
+  StrLen: Byte;
+  TNum: Integer;
+  TEnd: Integer;
+begin
+
+  if SepChar = '#' then
+  begin
+    RChar := '*'
+  end
+  else
+  begin
+    RChar := '#'
+  end;
+  StrLen := Length(aString);
+  TNum := 0;
+  TEnd := StrLen;
+  while TEnd <> 0 do
+  begin
+    Inc(TNum);
+    TEnd := Pos(SepChar, aString);
+    if TEnd <> 0 then
+    begin
+      aString[TEnd] := RChar;
+    end;
+  end;
+  Result := TNum;
+end;
+
+function TMSCryptoAPI.strV(s: string; finfT: string): string;
+var
+  i: Integer;
+  str: string;
+begin
+  for i := 1 to (NumToken(s, ',')) do
+  begin
+    str := GetToken(s, ',', i);
+    if pos(finfT, str) > 0 then
+    begin
+      str := StringReplace(str, finfT, '', []);
+      str := StringReplace(str, '"', '', [rfReplaceAll, rfIgnoreCase]);
+      Result := trim(str);
+    end;
+  end;
+end;
+
+procedure TMSCryptoAPI.PrepareCertificates;
+
+  function ByteArrayToStrInv(pbData: PByte; cbData: DWORD): string;
+  var
+    i, J: Integer;
+    S: string;
+  begin
+    Result := '';
+    if not Assigned(pbData) or (cbData <= 0) then
+      Exit;
+    for i := 0 to cbData - 1 - 2 do
+    begin
+      J := PByteArray(pbData)^[cbData - 1 - Cardinal(i)];
+      S := IntToHex(J, 2);
+      Result := S + Result;
+    end;
+  end;
+
+  function BytesToHex(Value: PAnsiChar; Count: Integer): string;
+  var
+    i: Integer;
+  begin
+    Result := '';
+    for i := 0 to Count - 1 do
+    begin
+      Result := Result + IntToHex(Byte(Value[i]), 2);
+    end;
+  end;
+
+  function GetCertificateU(Cert: PCCERT_CONTEXT): string;
+  var
+    certValue: string;
+  begin
+    SetLength(certValue, Cert.pCertInfo^.rgExtension.Value.cbData);
+    system.Move(Cert.pCertInfo^.rgExtension.Value.pbData^, Pointer(certValue)^, Cert.pCertInfo^.rgExtension.Value.cbData);
+    Result := BytesToHex(PAnsiChar(certValue), Cert.pCertInfo^.rgExtension.Value.cbData);
+  end;
+
+var
+  prov: HCRYPTPROV;
+  store: HCERTSTORE;
+  cont, stor: PChar;
+  err: string;
+  cert: PCCERT_CONTEXT;
+  nameString, nameString1: PChar;
+  size: DWORD;
+  nameBLOB: CERT_NAME_BLOB;
+  encType: DWORD;
+  aSigningCertificate: ISigningCertificate;
+  systemTime: TSYSTEMTIME;
+  sert_key, sert_Issuer: string;
+  d1, d: TDateTime;
+  arExtension: array of CERT_EXTENSION;
+  j: Integer;
+begin
+  inherited;
+  d := Date;
+  d1 := Date;
+  arExtension := nil;
+  encType := PKCS_7_ASN_ENCODING or X509_ASN_ENCODING;
+  cont := nil;
+  if not CryptAcquireContext(@prov, cont, nil, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT) then
+  begin
+    case int64(GetLastError) of
+      ERROR_INVALID_PARAMETER: err := 'ERROR_INVALID_PARAMETER';
+      ERROR_NOT_ENOUGH_MEMORY: err := 'ERROR_NOT_ENOUGH_MEMORY';
+      NTE_BAD_FLAGS: err := 'NTE_BAD_FLAGS';
+      NTE_BAD_KEYSET: err := 'NTE_BAD_KEYSET';
+      NTE_BAD_KEYSET_PARAM: err := 'NTE_BAD_KEYSET_PARAM';
+      NTE_BAD_PROV_TYPE: err := 'NTE_BAD_PROV_TYPE';
+      NTE_BAD_SIGNATURE: err := 'NTE_BAD_SIGNATURE';
+      NTE_EXISTS: err := 'NTE_EXISTS';
+      NTE_KEYSET_ENTRY_BAD: err := 'NTE_KEYSET_ENTRY_BAD';
+      NTE_KEYSET_NOT_DEF: err := 'NTE_KEYSET_NOT_DEF';
+      NTE_NO_MEMORY: err := 'NTE_NO_MEMORY';
+      NTE_PROV_DLL_NOT_FOUND: err := 'NTE_PROV_DLL_NOT_FOUND';
+      NTE_PROV_TYPE_ENTRY_BAD: err := 'NTE_PROV_TYPE_ENTRY_BAD';
+      NTE_PROV_TYPE_NO_MATCH: err := 'NTE_PROV_TYPE_NO_MATCH';
+      NTE_PROV_TYPE_NOT_DEF: err := 'NTE_PROV_TYPE_NOT_DEF';
+      NTE_PROVIDER_DLL_FAIL: err := 'NTE_PROVIDER_DLL_FAIL';
+      NTE_SIGNATURE_FILE_BAD: err := 'NTE_SIGNATURE_FILE_BAD';
+    else
+      err := 'Unknown error';
+    end;
+    MessageDlg('Ошибка создания контейнера: ' + err, mtError, [mbOK], 0);
+    if cont <> nil then
+      StrDispose(cont);
+    Exit;
+  end;
+  err := 'MY';
+  stor := StrAlloc(length(err) + 1);
+  StrPCopy(stor, err);
+  store := CertOpenSystemStore(prov, stor);
+  if store = nil then
+  begin
+    MessageDlg('Error opening store', mtError, [mbOK], 0);
+    if cont <> nil then
+      StrDispose(cont);
+    StrDispose(stor);
+    Exit;
+  end;
+  cert := CertEnumCertificatesInStore(store, nil);
+  nameString := StrAlloc(512);
+  nameString1 := StrAlloc(512);
+  while cert <> nil do
+  begin
+    nameBLOB := cert^.pCertInfo^.Subject;
+    size := CertNameToStr(encType, @nameBlob, CERT_X500_NAME_STR, nameString1, 512);
+    if size > 1 then
+    begin
+
+      FileTimeToSystemTime(cert^.pCertInfo^.NotBefore, systemTime);
+      d := SystemTimeToDateTime(SystemTime);
+
+      FileTimeToSystemTime(cert^.pCertInfo^.NotAfter, systemTime);
+      d1 := SystemTimeToDateTime(SystemTime);
+
+      sert_Issuer := GetCertificateU(cert);
+
+      pointer(arExtension) := cert^.pCertInfo^.rgExtension;
+      sert_key := '';
+      for j := 0 to cert^.pCertInfo^.cExtension - 1 do
+      begin
+        if arExtension[J].pszObjId = '2.5.29.14' then
+        begin
+          sert_key := ByteArrayToStrInv(arExtension[J].Value.pbData, arExtension[J].Value.cbData);
+        end;
+      end;
+      arExtension := nil;
+    end;
+
+    size := CertNameToStr(encType, @nameBlob, CERT_X500_NAME_STR, nameString, 512);
+
+    if size>1 then
+      if (p_filter.Count = 0) or (FindTStrings(p_filter, sert_key)) then
+      begin
+        aSigningCertificate := FSigningCertificates.Add;
+        aSigningCertificate.Name := strV(nameString1, 'CN=');
+        aSigningCertificate.Note := nameString1;
+        aSigningCertificate.NotBefore := d;
+        aSigningCertificate.NotAfter := d1;
+        aSigningCertificate.Key := sert_key;
+        aSigningCertificate.SignerName := strV(nameString1, 'SN=') + ' ' + strV(nameString1, 'Отчество=');
+        aSigningCertificate.PublisherName := strV(nameString, 'CN=');
+        aSigningCertificate.PublisherCertificateKey := copy(sert_Issuer, 9, length(sert_Issuer));
+      end;
+
+    cert := CertEnumCertificatesInStore(store, cert);
+
+  end;
+  StrDispose(nameString);
+  if cont <> nil then
+    StrDispose(cont);
+  StrDispose(stor);
+  if not CertCloseStore(store, 0) then
+    MessageDlg('Ошибка закрытия хранилища', mtError, [mbOK], 0);
+  if not CryptReleaseContext(prov, 0) then
+    MessageDlg('Ошибка освобождения контекста', mtError, [mbOK], 0);
+
+end;
+
+function TMSCryptoAPI.ValidateLoginTopby(const ACertificateKey, ALogin, APassword: string;
+  var AMessage: string): Boolean;
+var
+  Signer: ISigner;
+  res_str: string;
+begin
+  Result := ValidateLoginTopby(ACertificateKey, ALogin, APassword, AMessage);
+  if not Result then
+    Exit;
+  Result := False;
+  Signer := CoSigner.Create;
+  try
+    res_str := Signer.Sign(ACertificateKey, '*');
+    if pos('[[', res_str) > 0 then
+    begin
+      Result := False;
+    end
+    else
+    begin
+      Result := True;
+    end;
+  except
+    on E: Exception do
+      AMessage := E.Message;
+  end;
+end;
+
+function TMSCryptoAPI.SignTopby(const ACertificateKey, ALogin, APassword: string;
+  const AContent: string; var ASign, AMessage: string): Boolean;
+var
+  Signer: ISigner;
+  res_str: string;
+begin
+  Result := inherited Sign(ACertificateKey, ALogin, APassword, AContent, ASign,
+    AMessage);
+  if not Result then
+    Exit;
+  Result := False;
+  Signer := CoSigner.Create;
+  try
+    res_str := Signer.Sign(ACertificateKey, AContent);
+    if pos('[[', res_str) > 0 then
+    begin
+      AMessage := res_str;
+      ASign := '';
+      Result := False;
+    end
+    else
+    begin
+      ASign := res_str;
+      Result := True;
+    end;
+  except
+    on E: Exception do
+      AMessage := E.Message;
+  end;
+end;
+
+function TMSCryptoAPI.SignXMLTopby(const ACertificateKey, ALogin, APassword: string;
+  const AContent: WideString; var ASign, AMessage: string): Boolean;
+const
+  TEG_BEGIN_DELIVERYNODE: WideString = '<DeliveryNote>';
+  TEG_END_DELIVERYNODE: WideString = '</DeliveryNote>';
+var
+  Signer: ISigner;
+  PosBegin, PosEnd: Integer;
+  BlockForSignature: WideString;
+  res_str: string;
+  Doc: IXMLDOMDocument3;
+begin
+  Result := False;
+  Signer := CoSigner.Create;
+  Doc := CoDOMDocument60.Create;
+  Doc.loadXML(AContent);
+
+  PosBegin := Pos(TEG_BEGIN_DELIVERYNODE, Doc.xml);
+  PosEnd := Pos(TEG_END_DELIVERYNODE, Doc.xml);
+  BlockForSignature := Copy(Doc.xml, PosBegin, PosEnd - PosBegin + Length(TEG_END_DELIVERYNODE));
+  BlockForSignature := StringReplace(BlockForSignature, #13#10, '', [rfReplaceAll, rfIgnoreCase]);
+  BlockForSignature := StringReplace(BlockForSignature, #9, '', [rfReplaceAll, rfIgnoreCase]);
+  BlockForSignature := StringReplace(BlockForSignature, #13, '', [rfReplaceAll, rfIgnoreCase]);
+  BlockForSignature := StringReplace(BlockForSignature, #10, '', [rfReplaceAll, rfIgnoreCase]);
+
+  try
+    res_str := Signer.SignXML(ACertificateKey, APassword, BlockForSignature);
+    if pos('[[', res_str) > 0 then
+    begin
+      AMessage := res_str;
+      ASign := '';
+      Result := False;
+    end
+    else
+    begin
+      ASign := res_str;
+      Result := True;
+    end;
+  except
+    on E: Exception do
+      AMessage := E.Message;
+  end;
+end;
+
+function TMSCryptoAPI.ValidateLogin(const ACertificateKey, ALogin, APassword: string;
+  var AMessage: string): Boolean;
+const
+  AVCM_DB_CONNECTSTR: string = '0x4';
+  AVCMF_FORCE_TOKEN_CONTROL: string = '0x10000';
+var
+  AvCryptMailSystem: IAvCryptMailSystem;
+  AvConnection: IAvCMConnection;
+  Content, Auth: IAvCMBlob;
+  AvParam: IAvCMParameters;
+  fl_not_err: Boolean;
+begin
+  Result :=inherited ValidateLogin(ACertificateKey, ALogin, APassword, AMessage);
+  if not Result then
+    Exit;
+
+  AvCryptMailSystem := CoCAvCryptMailSystem.Create;
+  AvConnection := CoCAvCMConnection.Create;
+  Content := CoCAvCMBlob.Create;
+  AvParam := CoCAvCMParameters.Create;
+
+  fl_not_err := True;
+
+  try
+    Auth := AvCryptMailSystem.CreateBlob(0);
+    Auth.SetAsText('PUB_KEY_ID=' + ALogin + ';PASSWORD_KEY=' + APassword + '', 0);
+    AvParam.AddParameter(StrToInt(AVCM_DB_CONNECTSTR), Auth, 0);
+    AvConnection := AvCryptMailSystem.CreateConnection(AvParam, StrToInt(AVCMF_FORCE_TOKEN_CONTROL));
+  except
+    AMessage := AvCryptMailSystem.GetErrorInformation(AvCryptMailSystem.GetLastError, 0);
+    fl_not_err := False;
+  end;
+  Result := fl_not_err;
+end;
+
+procedure TMSCryptoAPI.AddTextNode(const ParentNodeXPath, ATextNode: WideString);
+var
+  Node: IXMLDOMNode;
+begin
+  with Doc.documentElement.selectNodes(ParentNodeXPath) do
+  begin
+    Node := item[length - 1];
+  end;
+  if Assigned(Node) then
+    Node.appendChild(Doc.createTextNode(ATextNode));
+
+end;
+
+procedure TMSCryptoAPI.AddSubNode(const ParentNodeXPath, ElementName: string);
+const
+  NS = '';
+var
+  Node: IXMLDOMNode;
+begin
+  with Doc.documentElement.selectNodes(ParentNodeXPath) do
+  begin
+    Node := item[length - 1];
+  end;
+  if Assigned(Node) then
+    Node.appendChild(Doc.CreateNode(NODE_ELEMENT, ElementName, NS))
+end;
+
+function TMSCryptoAPI.Sign(const ACertificateKey, ALogin, APassword: string;
+  const AContent: string; var ASign, AMessage: string): Boolean;
+const
+  AVCM_DB_CONNECTSTR: string = '0x4';
+  AVCMF_FORCE_TOKEN_CONTROL: string = '0x10000';
+  TEG_BEGIN_DELIVERYNODE: WideString = '<DeliveryNote>';
+  TEG_END_DELIVERYNODE: WideString = '</DeliveryNote>';
+  AVCMXF_UTF8_STRING = 4;
+  AVCMF_IN_RAW_DATA = '0x100';
+  AVCMF_IN_PKCS7 = '0x200';
+  AVCMF_DETACHED = '0x2000000';
+  AVCMF_ADD_SIGN_CERT = '0x100000';
+  AVCMF_OPEN_FOR_SIGN = '0x1000';
+  FMessage = 'Ошибка структуры файла не найдены теги DeliveryNote';
+  provider_sert_id = '40E46B8D534E248000000002';
+var
+  AvCryptMailSystem: IAvCryptMailSystem;
+  AvConnection: IAvCMConnection;
+  Content, Auth: IAvCMBlob;
+  AvParam: IAvCMParameters;
+  AvRawMes: IAvCMRawMessage;
+  AvSignMes, AvSignMesFinal: IAvCMSignedMessage;
+  fl_not_err: Boolean;
+  SignDateTime: TDateTime;
+  PosBegin, PosEnd: Integer;
+  BlockForSignature: WideString;
+  TypeXml: string;
+  Node, NodeRef, NewNode: IXMLDOMNode;
+begin
+  Result := inherited Sign(ACertificateKey, ALogin, APassword, AContent, ASign,
+    AMessage);
+  if not Result then
+    Exit;
+
+  AvCryptMailSystem := CoCAvCryptMailSystem.Create;
+  AvConnection := CoCAvCMConnection.Create;
+  Content := CoCAvCMBlob.Create;
+  AvParam := CoCAvCMParameters.Create;
+
+  fl_not_err := True;
+
+  try
+    //Авторизация
+    Auth := AvCryptMailSystem.CreateBlob(0);
+    Auth.SetAsText('PUB_KEY_ID=' + ALogin + ';PASSWORD_KEY=' + APassword + '', 0);
+    AvParam.AddParameter(StrToInt(AVCM_DB_CONNECTSTR), Auth, 0);
+    AvConnection := AvCryptMailSystem.CreateConnection(AvParam, StrToInt(AVCMF_FORCE_TOKEN_CONTROL));
+  except
+    AMessage := AvCryptMailSystem.GetErrorInformation(AvCryptMailSystem.GetLastError, 0);
+    fl_not_err := False;
+  end;
+
+  try
+    Doc := CoDOMDocument60.Create;
+    Doc.async := False;
+    Doc.validateOnParse := False;
+    Doc.loadXML(AContent);
+
+  {  PosBegin := Pos(TEG_BEGIN_DELIVERYNODE, Doc.xml);
+    PosEnd := Pos(TEG_END_DELIVERYNODE, Doc.xml);     }
+
+    //BlockForSignature := Copy(Doc.xml, PosBegin, PosEnd - PosBegin + Length(TEG_END_DELIVERYNODE));
+    BlockForSignature := Doc.xml;
+    BlockForSignature := StringReplace(BlockForSignature, #13#10, '', [rfReplaceAll, rfIgnoreCase]);
+    BlockForSignature := StringReplace(BlockForSignature, #9, '', [rfReplaceAll, rfIgnoreCase]);
+    BlockForSignature := StringReplace(BlockForSignature, #13, '', [rfReplaceAll, rfIgnoreCase]);
+    BlockForSignature := StringReplace(BlockForSignature, #10, '', [rfReplaceAll, rfIgnoreCase]);    
+
+    if (length(BlockForSignature) > 0) and fl_not_err then
+    begin
+      Content := AvCryptMailSystem.CreateBlob(0);
+      Content.SetAsText(BlockForSignature, AVCMXF_UTF8_STRING);
+      AvRawMes := AvConnection.CreateMessage(content, StrToInt(AVCMF_IN_RAW_DATA)) as IAvCMRawMessage;
+      AvSignMes := AvRawMes.Sign(StrToInt(AVCMF_DETACHED) or StrToInt(AVCMF_ADD_SIGN_CERT));
+      AvSignMesFinal := AvConnection.CreateMessage(AvSignMes.Blob, StrToInt(AVCMF_IN_PKCS7)) as IAvCMSignedMessage;
+    { TypeXml := VarToStr(Doc.documentElement.childNodes.item[0].childNodes.item[2].Text);
+      Node := Doc.selectNodes(TypeXml).item[0];
+      NodeRef := DOc.documentElement.selectNodes('DeliveryNote').item[0];
+
+      NewNode := Node.appendChild(Doc.createNode(NODE_ELEMENT, 'SpecialPart', ''));
+
+      AddSubNode('/' + TypeXml + '/SpecialPart', 'CanonizationAlghoritm');
+      AddTextNode('/' + TypeXml + '/SpecialPart/CanonizationAlghoritm', 'www.w3.org/TR/xml-c14n11');
+
+      NewNode.appendChild(Doc.createNode(NODE_ELEMENT, 'Signature', ''));
+
+      AddSubNode('/' + TypeXml + '/SpecialPart/Signature', 'SecurityID');
+      AddTextNode('/' + TypeXml + '/SpecialPart/Signature/SecurityID', '1');
+
+      AddSubNode('/' + TypeXml + '/SpecialPart/Signature', 'CertificateID');
+      AddTextNode('/' + TypeXml + '/SpecialPart/Signature/CertificateID', AvSignMesFinal.Signs[0].SignerCertificate.Serial.GetAsHex(AVCMXF_UTF8_STRING));
+
+      AddSubNode('/' + TypeXml + '/SpecialPart/Signature', 'CertificateSubject');
+      AddTextNode('/' + TypeXml + '/SpecialPart/Signature/CertificateSubject', AvSignMesFinal.Signs[0].SignerCertificate.GetSubjectNameAttributeByOid('2.5.4.4', 0).Value
+        + ' ' + AvSignMesFinal.Signs[0].SignerCertificate.GetSubjectNameAttributeByOid('2.5.4.41', 0).Value);
+
+      AddSubNode('/' + TypeXml + '/SpecialPart/Signature', 'SecurityPartyID');
+      AddTextNode('/' + TypeXml + '/SpecialPart/Signature/SecurityPartyID', provider_sert_id);
+
+      AddSubNode('/' + TypeXml + '/SpecialPart/Signature', 'SecurityPartyName');
+      AddTextNode('/' + TypeXml + '/SpecialPart/Signature/SecurityPartyName', strV(AvSignMesFinal.Signs[0].SignerCertificate.Issuer, 'CN='));
+
+      SignDateTime := AvSignMesFinal.Signs[0].SignDateTime;
+      AddSubNode('/' + TypeXml + '/SpecialPart/Signature', 'SignatureDateTime');
+      AddTextNode('/' + TypeXml + '/SpecialPart/Signature/SignatureDateTime', FormatDateTime('YYYYMMDDhhnnss', SignDateTime));
+      }
+      BlockForSignature := AvSignMesFinal.Blob.GetAsBase64(AVCMXF_UTF8_STRING);
+      BlockForSignature := StringReplace(BlockForSignature, #13#10, '', [rfReplaceAll, rfIgnoreCase]);
+      BlockForSignature := StringReplace(BlockForSignature, #9, '', [rfReplaceAll, rfIgnoreCase]);
+      BlockForSignature := StringReplace(BlockForSignature, #13, '', [rfReplaceAll, rfIgnoreCase]);
+      BlockForSignature := StringReplace(BlockForSignature, #10, '', [rfReplaceAll, rfIgnoreCase]);
+
+     { AddSubNode('/' + TypeXml + '/SpecialPart/Signature', 'SignatureValue');
+      AddTextNode('/' + TypeXml + '/SpecialPart/Signature/SignatureValue', BlockForSignature);   }
+
+      //ASign := Doc.xml;
+      ASign := BlockForSignature;
+    end
+    else
+    begin
+      fl_not_err := False;
+      AMessage := FMessage;
+    end;
+
+  except
+    on E: Exception do
+    begin
+      AMessage := E.Message;
+      fl_not_err := False;
+    end;
+  end;
+
+  Result := fl_not_err;
+end;
+
+function TMSCryptoAPI.NeedAuthorization: Boolean;
+begin
+  Result := True;
+end;
+
+end.
